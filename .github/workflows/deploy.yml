@@ -1,0 +1,110 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  REGISTRY: ghcr.io/qreva-systems
+  SERVICE_NAME: dashboard
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The API base URL is compiled into the bundle, so the image is
+      # environment-specific and the URL has to be chosen here. A push to main
+      # builds :latest for the dev environment; a dispatch picks the target.
+      - name: Resolve API base URL
+        id: api
+        run: |
+          case "${{ steps.tag.outputs.tag }}" in
+            prod)    echo "url=https://api.qreva.app" >> "$GITHUB_OUTPUT" ;;
+            staging) echo "url=https://sandbox-api.qreva.app" >> "$GITHUB_OUTPUT" ;;
+            *)       echo "url=https://sandbox-api.qreva.app" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build and push
+        run: |
+          docker build \
+            --build-arg VITE_BASE_URL=${{ steps.api.outputs.url }} \
+            -t ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:${{ steps.tag.outputs.tag }} \
+            -t ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:sha-${{ github.sha }} \
+            .
+          docker push ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:${{ steps.tag.outputs.tag }}
+          docker push ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:sha-${{ github.sha }}
+
+  deploy:
+    name: Deploy to Server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "env=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "env=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /opt/qreva-infra
+            ENV=${{ steps.env.outputs.env }}
+            COMPOSE_FILES="-f docker-compose.yml -f docker-compose.${ENV}.yml -f docker-compose.migration.yml"
+
+            case "$ENV" in
+              dev) DOPPLER_CFG=dev ;;
+              staging) DOPPLER_CFG=stg ;;
+              prod) DOPPLER_CFG=prd ;;
+            esac
+
+            if command -v doppler &> /dev/null; then
+              RUN="doppler run -p qreva -c ${DOPPLER_CFG} --"
+            else
+              RUN="env $(cat envs/.env.${ENV} | grep -v '^#' | xargs)"
+            fi
+
+            $RUN docker compose ${COMPOSE_FILES} pull dashboard
+            $RUN docker compose ${COMPOSE_FILES} up -d --no-deps dashboard
+            docker image prune -f

@@ -1,0 +1,63 @@
+name: Build & Deploy Dev Dashboard
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io/qreva-systems
+  SERVICE_NAME: dashboard
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build & Push Image (dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push dev image
+        run: |
+          docker build \
+            --build-arg VITE_BASE_URL=https://sandbox-api.qreva.app \
+            -t ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:dev \
+            -t ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:sha-${{ github.sha }} \
+            .
+          docker push ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:dev
+          docker push ${{ env.REGISTRY }}/${{ env.SERVICE_NAME }}:sha-${{ github.sha }}
+
+  deploy:
+    name: Deploy Dev Dashboard to Server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST || secrets.DROPLET_HOST }}
+          username: ${{ secrets.SERVER_USER || 'root' }}
+          key: ${{ secrets.SERVER_SSH_KEY || secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/qreva-infra
+            COMPOSE_FILES="-f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.migration.yml"
+
+            if command -v doppler &> /dev/null; then
+              RUN="doppler run -p qreva -c dev --"
+            else
+              RUN="env $(cat envs/.env.dev | grep -v '^#' | xargs)"
+            fi
+
+            $RUN docker compose ${COMPOSE_FILES} pull dashboard-dev
+            $RUN docker compose ${COMPOSE_FILES} up -d --no-deps dashboard-dev
+            docker image prune -f
